@@ -17,6 +17,7 @@ RUN apt-get update \
         cmake \
         g++-13 \
         gcc-13 \
+        gh \
         git \
         make \
         ninja-build \
