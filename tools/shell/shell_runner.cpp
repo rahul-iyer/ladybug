@@ -1,7 +1,10 @@
 #include <iostream>
+#include <sstream>
 
 #include "args.hxx"
+#include "common/file_system/file_info.h"
 #include "common/file_system/local_file_system.h"
+#include "common/file_system/virtual_file_system.h"
 #include "common/string_utils.h"
 #include "common/task_system/progress_bar.h"
 #include "embedded_shell.h"
@@ -24,11 +27,16 @@ int setConfigOutputMode(const std::string& mode, ShellConfig& shell) {
 
 void addInitFileDirToSearchPath(const std::shared_ptr<Connection>& conn,
     const std::string& initFile) {
-    auto initDir = std::filesystem::path{initFile}.parent_path();
-    if (initDir.empty()) {
+    auto slashPos = initFile.find_last_of('/');
+    if (slashPos == std::string::npos) {
         return;
     }
-    auto initDirPath = std::filesystem::absolute(initDir).lexically_normal().string();
+    auto initDirPath = initFile.substr(0, slashPos);
+    if (initDirPath.empty()) {
+        initDirPath = "/";
+    } else if (initFile.find("://") == std::string::npos) {
+        initDirPath = std::filesystem::absolute(initDirPath).lexically_normal().string();
+    }
     auto clientConfig = conn->getClientContext()->getClientConfigUnsafe();
     auto& fileSearchPath = clientConfig->fileSearchPath;
     if (!fileSearchPath.empty()) {
@@ -42,29 +50,36 @@ void addInitFileDirToSearchPath(const std::shared_ptr<Connection>& conn,
     fileSearchPath = initDirPath;
 }
 
-void processRunCommands(EmbeddedShell& shell, const std::string& filename) {
-    FILE* fp = fopen(filename.c_str(), "r");
-    char buf[LINENOISE_MAX_LINE + 1];
-    buf[LINENOISE_MAX_LINE] = '\0';
-
-    if (fp == NULL) {
+void processRunCommands(EmbeddedShell& shell, const std::shared_ptr<Connection>& conn,
+    const std::string& filename) {
+    std::string fileContents;
+    try {
+        auto context = conn->getClientContext();
+        auto fileInfo = VirtualFileSystem::GetUnsafe(*context)->openFile(filename,
+            FileOpenFlags(FileFlags::READ_ONLY), context);
+        auto fileSize = fileInfo->getFileSize();
+        fileContents.resize(fileSize);
+        if (fileSize > 0) {
+            fileInfo->readFromFile(fileContents.data(), fileSize, 0);
+        }
+    } catch (Exception& e) {
         if (filename != ".lbugrc") {
-            std::cerr << "Warning: cannot open init file: " << filename << '\n';
+            std::cerr << "Warning: cannot open init file: " << filename << ": " << e.what() << '\n';
         }
         return;
     }
 
     std::cout << "-- Processing: " << filename << '\n';
-    while (fgets(buf, LINENOISE_MAX_LINE, fp) != NULL) {
-        auto queryResults = shell.processInput(buf);
+    std::istringstream stream{fileContents};
+    std::string line;
+    while (std::getline(stream, line)) {
+        line += '\n';
+        auto queryResults = shell.processInput(line);
         for (auto& queryResult : queryResults) {
             if (!queryResult->isSuccess()) {
-                shell.printErrorMessage(buf, *queryResult);
+                shell.printErrorMessage(line, *queryResult);
             }
         }
-    }
-    if (fclose(fp) != 0) {
-        // continue regardless of error
     }
 }
 
@@ -213,7 +228,7 @@ int main(int argc, char* argv[]) {
     }
     try {
         auto shell = EmbeddedShell(database, conn, shellConfig);
-        processRunCommands(shell, initFile);
+        processRunCommands(shell, conn, initFile);
         if (shellConfig.stats) {
             if (DBConfig::isDBPathInMemory(databasePath)) {
                 std::cout << "Opening the database under in-memory mode." << '\n';

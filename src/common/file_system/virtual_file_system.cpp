@@ -1,5 +1,7 @@
 #include "common/file_system/virtual_file_system.h"
 
+#include <cctype>
+
 #include "common/assert.h"
 #include "common/exception/io.h"
 #include "common/file_system/gzip_file_system.h"
@@ -10,6 +12,30 @@
 
 namespace lbug {
 namespace common {
+
+static bool isRelativePath(const std::string& path) {
+    if (path.empty() || path[0] == '/' || path[0] == '~') {
+        return false;
+    }
+    if (path.find("://") != std::string::npos) {
+        return false;
+    }
+    return !(
+        path.size() > 1 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':');
+}
+
+static std::string joinRemotePath(const std::string& base, std::string path) {
+    while (path.starts_with("./")) {
+        path = path.substr(2);
+    }
+    if (path == ".") {
+        path.clear();
+    }
+    if (path.empty() || base.ends_with('/')) {
+        return base + path;
+    }
+    return base + "/" + path;
+}
 
 VirtualFileSystem::VirtualFileSystem() : VirtualFileSystem{""} {}
 
@@ -150,6 +176,22 @@ std::string VirtualFileSystem::resolvePath(main::ClientContext* context, const s
     auto paths = vfs->glob(context, path);
     if (!paths.empty()) {
         return paths.front();
+    }
+    if (!isRelativePath(path)) {
+        return path;
+    }
+    const auto& fileSearchPath = context->getClientConfig()->fileSearchPath;
+    if (fileSearchPath.empty()) {
+        return path;
+    }
+    for (auto& searchPath : StringUtils::split(fileSearchPath, ",")) {
+        if (searchPath.find("://") == std::string::npos) {
+            continue;
+        }
+        paths = vfs->glob(context, joinRemotePath(searchPath, path));
+        if (!paths.empty()) {
+            return paths.front();
+        }
     }
     return path;
 }
