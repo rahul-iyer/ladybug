@@ -26,7 +26,7 @@ True
 8
 -STATEMENT CALL storage_info('person') RETURN COUNT(*)
 ---- 1
-58
+78
 # TODO(Guodong/Sam): FIX-ME
 #-STATEMENT CALL storage_info('knows') RETURN COUNT(*)
 #---- 1
@@ -68,3 +68,12 @@ Index storage_info_idx_person_name has been created.
 -STATEMENT CALL disk_info() WHERE category = 'index' AND name = 'storage_info_idx_person.storage_info_idx_person_name:tree' RETURN count(*), min(num_pages) > 0, min(size_bytes) > 0;
 ---- 1
 1|True|True
+-STATEMENT CALL disk_info() WHERE category = 'index' AND name = 'storage_info_idx_person._PK:hash_index_headers' RETURN count(*), min(num_pages) = 2, min(size_bytes) > 0;
+---- 1
+1|True|True
+-STATEMENT CALL disk_info() WHERE category = 'index' AND name STARTS WITH 'storage_info_idx_person._PK' RETURN count(*), sum(num_pages) > 0;
+---- 1
+3|True
+-STATEMENT CALL disk_info() WITH sum(CASE WHEN category = 'unaccounted' THEN num_pages ELSE 0 END) AS unaccounted_pages RETURN unaccounted_pages;
+---- 1
+0

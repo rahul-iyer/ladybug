@@ -121,5 +121,19 @@ void DiskArrayCollection::reclaimStorage(PageAllocator& pageAllocator,
     }
 }
 
+std::vector<PageRange> DiskArrayCollection::getPageRanges(
+    common::page_idx_t firstHeaderPage) const {
+    std::vector<PageRange> result;
+    auto headerPage = firstHeaderPage;
+    for (page_idx_t indexInMemory = 0; indexInMemory < headersForReadTrx.size(); indexInMemory++) {
+        if (headerPage == INVALID_PAGE_IDX) {
+            break;
+        }
+        result.emplace_back(headerPage, 1);
+        headerPage = headersForReadTrx[indexInMemory]->nextHeaderPage;
+    }
+    return result;
+}
+
 } // namespace storage
 } // namespace lbug

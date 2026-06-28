@@ -4,6 +4,7 @@
 
 #include "common/types/types.h"
 #include "disk_array.h"
+#include "storage/page_range.h"
 
 namespace lbug {
 namespace storage {
@@ -48,6 +49,7 @@ public:
     }
 
     void reclaimStorage(PageAllocator& pageAllocator, common::page_idx_t firstHeaderPage) const;
+    std::vector<PageRange> getPageRanges(common::page_idx_t firstHeaderPage) const;
 
     template<typename T>
     std::unique_ptr<DiskArray<T>> getDiskArray(uint32_t idx) {

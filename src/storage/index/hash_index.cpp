@@ -133,6 +133,25 @@ void HashIndex<T>::reclaimStorage(PageAllocator& pageAllocator) {
     oSlots->reclaimStorage(pageAllocator);
 }
 
+static void appendStorageEntries(std::vector<IndexStorageEntry>& entries,
+    std::string_view component, const std::vector<PageRange>& pageRanges) {
+    for (const auto& pageRange : pageRanges) {
+        if (pageRange.startPageIdx == INVALID_PAGE_IDX || pageRange.numPages == 0) {
+            continue;
+        }
+        entries.push_back(IndexStorageEntry{std::string{component}, pageRange,
+            pageRange.numPages * LBUG_PAGE_SIZE});
+    }
+}
+
+template<typename T>
+std::vector<IndexStorageEntry> HashIndex<T>::getStorageEntries() const {
+    std::vector<IndexStorageEntry> entries;
+    appendStorageEntries(entries, "primary_slots", pSlots->getPageRanges());
+    appendStorageEntries(entries, "overflow_slots", oSlots->getPageRanges());
+    return entries;
+}
+
 template<typename T>
 void HashIndex<T>::splitSlots(PageAllocator& pageAllocator, const Transaction* transaction,
     HashIndexHeader& header, slot_id_t numSlotsToSplit) {
@@ -731,6 +750,25 @@ void PrimaryKeyIndex::reclaimStorage(PageAllocator& pageAllocator) const {
     if (firstHeaderPage != INVALID_PAGE_IDX) {
         pageAllocator.freePageRange({getFirstHeaderPage(), NUM_HEADER_PAGES});
     }
+}
+
+std::vector<IndexStorageEntry> PrimaryKeyIndex::getStorageEntries() const {
+    std::vector<IndexStorageEntry> entries;
+    const auto firstHeaderPage = getFirstHeaderPage();
+    if (firstHeaderPage != INVALID_PAGE_IDX) {
+        entries.push_back(IndexStorageEntry{"hash_index_headers",
+            PageRange{firstHeaderPage, NUM_HEADER_PAGES}, NUM_HEADER_PAGES * LBUG_PAGE_SIZE});
+    }
+    appendStorageEntries(entries, "disk_array_headers",
+        hashIndexDiskArrays->getPageRanges(getDiskArrayFirstHeaderPage()));
+    for (auto i = 0u; i < hashIndices.size(); i++) {
+        auto indexEntries = hashIndices[i]->getStorageEntries();
+        entries.insert(entries.end(), indexEntries.begin(), indexEntries.end());
+    }
+    if (overflowFile) {
+        appendStorageEntries(entries, "string_overflow", overflowFile->getPageRanges());
+    }
+    return entries;
 }
 
 page_idx_t PrimaryKeyIndex::getDiskArrayFirstHeaderPage() const {

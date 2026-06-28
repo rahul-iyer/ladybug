@@ -251,6 +251,32 @@ void DiskArrayInternal::reclaimStorage(PageAllocator& pageAllocator) const {
     }
 }
 
+std::vector<PageRange> DiskArrayInternal::getPageRanges() const {
+    std::shared_lock lck{diskArraySharedMtx};
+    std::vector<PageRange> result;
+    auto appendPIP = [&result](const PIPWrapper& pip) {
+        for (auto pageIdx : pip.pipContents.pageIdxs) {
+            if (pageIdx != ShadowUtils::NULL_PAGE_IDX) {
+                result.emplace_back(pageIdx, 1);
+            }
+        }
+        if (pip.pipPageIdx != ShadowUtils::NULL_PAGE_IDX) {
+            result.emplace_back(pip.pipPageIdx, 1);
+        }
+    };
+    for (auto i = 0u; i < pips.size(); i++) {
+        if (i == pips.size() - 1 && pipUpdates.updatedLastPIP.has_value()) {
+            appendPIP(*pipUpdates.updatedLastPIP);
+        } else {
+            appendPIP(pips[i]);
+        }
+    }
+    for (const auto& newPIP : pipUpdates.newPIPs) {
+        appendPIP(newPIP);
+    }
+    return result;
+}
+
 bool DiskArrayInternal::hasPIPUpdatesNoLock(uint64_t pipIdx) const {
     // This is a request to a pipIdx > pips.size(). Since pips.size() is the original number of pips
     // we started with before the write transaction is updated, we return true, i.e., this PIP is

@@ -1,9 +1,15 @@
+#include <unordered_set>
+
 #include "binder/binder.h"
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/index_catalog_entry.h"
+#include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "function/table/bind_data.h"
 #include "function/table/bind_input.h"
 #include "function/table/simple_table_function.h"
+#include "main/client_context.h"
+#include "storage/storage_manager.h"
+#include "storage/table/node_table.h"
 #include "transaction/transaction.h"
 
 using namespace lbug::catalog;
@@ -39,6 +45,21 @@ struct ShowIndexesBindData final : TableFuncBindData {
         return std::make_unique<ShowIndexesBindData>(*this);
     }
 };
+
+static std::string getSeenKey(common::table_id_t tableID, const std::string& indexName) {
+    return std::to_string(tableID) + ":" + indexName;
+}
+
+template<typename ID_TYPE>
+static std::vector<std::string> getPropertyNames(const TableCatalogEntry& tableEntry,
+    const std::vector<ID_TYPE>& propertyIDs) {
+    std::vector<std::string> propertyNames;
+    propertyNames.reserve(propertyIDs.size());
+    for (auto propertyID : propertyIDs) {
+        propertyNames.push_back(tableEntry.getProperty(propertyID).getName());
+    }
+    return propertyNames;
+}
 
 static offset_t internalTableFunc(const TableFuncMorsel& morsel, const TableFuncInput& input,
     DataChunk& output) {
@@ -86,17 +107,14 @@ static std::unique_ptr<TableFuncBindData> bindFunc(const main::ClientContext* co
     std::vector<IndexInfo> indexesInfo;
     auto catalog = Catalog::Get(*context);
     auto transaction = transaction::Transaction::Get(*context);
+    std::unordered_set<std::string> seenIndexes;
     auto indexEntries = catalog->getIndexEntries(transaction);
     for (auto indexEntry : indexEntries) {
         auto tableEntry = catalog->getTableCatalogEntry(transaction, indexEntry->getTableID());
         auto tableName = tableEntry->getName();
         auto indexName = indexEntry->getIndexName();
         auto indexType = indexEntry->getIndexType();
-        auto properties = indexEntry->getPropertyIDs();
-        std::vector<std::string> propertyNames;
-        for (auto& property : properties) {
-            propertyNames.push_back(tableEntry->getProperty(property).getName());
-        }
+        auto propertyNames = getPropertyNames(*tableEntry, indexEntry->getPropertyIDs());
         auto dependencyLoaded = indexEntry->isLoaded();
         std::string indexDefinition;
         if (dependencyLoaded) {
@@ -107,6 +125,30 @@ static std::unique_ptr<TableFuncBindData> bindFunc(const main::ClientContext* co
         }
         indexesInfo.emplace_back(std::move(tableName), std::move(indexName), std::move(indexType),
             std::move(propertyNames), dependencyLoaded, std::move(indexDefinition));
+        seenIndexes.insert(getSeenKey(indexEntry->getTableID(), indexEntry->getIndexName()));
+    }
+
+    auto* storageManager = storage::StorageManager::Get(*context);
+    for (auto* tableEntry :
+        catalog->getNodeTableEntries(transaction, context->useInternalCatalogEntry())) {
+        const auto tableID = tableEntry->getTableID();
+        const auto hasCatalogPKIndex =
+            catalog->containsIndex(transaction, tableID, tableEntry->getPrimaryKeyID());
+        auto* nodeTable = storageManager->getTable(tableID)->ptrCast<storage::NodeTable>();
+        for (auto& indexHolder : nodeTable->getIndexes()) {
+            auto* index = indexHolder.getIndex();
+            const auto& storageIndexInfo = index->getIndexInfo();
+            if (seenIndexes.contains(getSeenKey(tableID, storageIndexInfo.name))) {
+                continue;
+            }
+            if (storageIndexInfo.isPrimary && hasCatalogPKIndex) {
+                continue;
+            }
+            indexesInfo.emplace_back(tableEntry->getName(), storageIndexInfo.name,
+                storageIndexInfo.indexType,
+                getPropertyNames(*tableEntry, storageIndexInfo.columnIDs), index->isLoaded(),
+                "" /* indexDefinition */);
+        }
     }
     return std::make_unique<ShowIndexesBindData>(indexesInfo, bindColumns(*input),
         indexesInfo.size());

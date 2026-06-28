@@ -170,6 +170,32 @@ void OverflowFileHandle::reclaimStorage(PageAllocator& pageAllocator) {
     }
 }
 
+std::vector<PageRange> OverflowFileHandle::getPageRanges() const {
+    std::vector<PageRange> result;
+    if (startPageIdx == INVALID_PAGE_IDX) {
+        return result;
+    }
+
+    auto pageIdx = startPageIdx;
+    while (true) {
+        if (pageIdx == 0 || pageIdx == INVALID_PAGE_IDX) [[unlikely]] {
+            throw RuntimeException(
+                "The overflow file has been corrupted, this should never happen.");
+        }
+        result.emplace_back(pageIdx, 1);
+
+        if (pageIdx == nextPosToWriteTo.pageIdx) {
+            break;
+        }
+
+        DASSERT(!pageWriteCache.contains(pageIdx));
+        overflowFile.readFromDisk(TransactionType::CHECKPOINT, pageIdx, [&pageIdx](auto* frame) {
+            pageIdx = *reinterpret_cast<page_idx_t*>(frame + END_OF_PAGE);
+        });
+    }
+    return result;
+}
+
 void OverflowFileHandle::read(TransactionType trxType, page_idx_t pageIdx,
     const std::function<void(uint8_t*)>& func) const {
     auto cachedPage = pageWriteCache.find(pageIdx);
@@ -275,6 +301,18 @@ void OverflowFile::reclaimStorage(PageAllocator& pageAllocator) const {
     if (headerPageIdx != INVALID_PAGE_IDX) {
         pageAllocator.freePage(headerPageIdx);
     }
+}
+
+std::vector<PageRange> OverflowFile::getPageRanges() const {
+    std::vector<PageRange> result;
+    if (headerPageIdx != INVALID_PAGE_IDX) {
+        result.emplace_back(headerPageIdx, 1);
+    }
+    for (auto& handle : handles) {
+        auto handlePageRanges = handle->getPageRanges();
+        result.insert(result.end(), handlePageRanges.begin(), handlePageRanges.end());
+    }
+    return result;
 }
 
 } // namespace storage

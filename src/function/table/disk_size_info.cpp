@@ -1,3 +1,5 @@
+#include <unordered_map>
+
 #include "binder/binder.h"
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
@@ -119,8 +121,23 @@ struct DiskSizeEntry {
     uint64_t sizeBytes;
 };
 
+static void appendOrIncrementEntry(std::vector<DiskSizeEntry>& entries,
+    std::unordered_map<std::string, idx_t>& entryLookup, std::string category, std::string name,
+    uint64_t numPages) {
+    const auto key = category + "\n" + name;
+    if (entryLookup.contains(key)) {
+        auto& entry = entries[entryLookup.at(key)];
+        entry.numPages += numPages;
+        entry.sizeBytes += numPages * LBUG_PAGE_SIZE;
+        return;
+    }
+    entryLookup.insert({key, entries.size()});
+    entries.push_back({std::move(category), std::move(name), numPages, numPages * LBUG_PAGE_SIZE});
+}
+
 static std::vector<DiskSizeEntry> collectDiskSizeInfo(const ClientContext* context) {
     std::vector<DiskSizeEntry> entries;
+    std::unordered_map<std::string, idx_t> entryLookup;
     auto storageManager = StorageManager::Get(*context);
     auto catalog = Catalog::Get(*context);
     auto dataFH = storageManager->getDataFH();
@@ -172,10 +189,9 @@ static std::vector<DiskSizeEntry> collectDiskSizeInfo(const ClientContext* conte
                     storageEntry.pageRange.numPages == 0) {
                     continue;
                 }
-                entries.push_back({"index",
+                appendOrIncrementEntry(entries, entryLookup, "index",
                     tableEntry->getName() + "." + indexInfo.name + ":" + storageEntry.component,
-                    storageEntry.pageRange.numPages,
-                    storageEntry.pageRange.numPages * LBUG_PAGE_SIZE});
+                    storageEntry.pageRange.numPages);
             }
         }
     }

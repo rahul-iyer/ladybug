@@ -7,6 +7,9 @@
 Table idx_default_person has been created.
 -STATEMENT CREATE (:idx_default_person {ID: 1, name: 'Alice'});
 ---- ok
+-STATEMENT CALL SHOW_INDEXES() RETURN table_name, index_name, index_type, property_names;
+---- 1
+idx_default_person|_PK|HASH|[ID]
 -STATEMENT CREATE INDEX idx_default_person_pk IF NOT EXISTS FOR (p:idx_default_person) ON (p.ID);
 ---- 1
 Index idx_default_person_pk has been created.
@@ -186,7 +189,8 @@ Table art_secondary_person has been created.
 ---- 1
 Index art_secondary_person_name has been created.
 -STATEMENT CALL SHOW_INDEXES() WHERE table_name = 'art_secondary_person' RETURN table_name, index_name, index_type, property_names ORDER BY index_name;
----- 1
+---- 2
+art_secondary_person|_PK|HASH|[ID]
 art_secondary_person|art_secondary_person_name|ART|[name]
 -STATEMENT MATCH (p:art_secondary_person) WHERE p.name = 'Ada' RETURN p.ID, p.rank ORDER BY p.rank DESC;
 ---- 2

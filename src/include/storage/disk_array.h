@@ -5,10 +5,12 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <vector>
 
 #include "common/copy_constructors.h"
 #include "common/types/types.h"
 #include "storage/buffer_manager/memory_manager.h"
+#include "storage/page_range.h"
 #include "storage/shadow_utils.h"
 #include "storage/storage_utils.h"
 #include "transaction/transaction.h"
@@ -134,6 +136,7 @@ public:
     void checkpoint();
 
     void reclaimStorage(PageAllocator& pageAllocator) const;
+    std::vector<PageRange> getPageRanges() const;
 
     // Write WriteIterator for making fast bulk changes to the disk array
     // The pages are cached while the elements are stored on the same page
@@ -247,7 +250,7 @@ protected:
     ShadowFile* shadowFile;
     std::vector<PIPWrapper> pips;
     PIPUpdates pipUpdates;
-    std::shared_mutex diskArraySharedMtx;
+    mutable std::shared_mutex diskArraySharedMtx;
     // For write transactions only
     common::page_idx_t lastAPPageIdx;
     common::page_idx_t lastPageOnDisk;
@@ -300,6 +303,7 @@ public:
     inline void reclaimStorage(PageAllocator& pageAllocator) const {
         diskArray.reclaimStorage(pageAllocator);
     }
+    inline std::vector<PageRange> getPageRanges() const { return diskArray.getPageRanges(); }
 
     class WriteIterator {
     public:

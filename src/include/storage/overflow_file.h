@@ -9,6 +9,7 @@
 #include "common/types/types.h"
 #include "storage//file_handle.h"
 #include "storage/index/hash_index_utils.h"
+#include "storage/page_range.h"
 #include "storage/storage_utils.h"
 
 namespace lbug {
@@ -61,6 +62,7 @@ public:
         this->nextPosToWriteTo = nextPosToWriteTo_;
     }
     void reclaimStorage(PageAllocator& pageAllocator);
+    std::vector<PageRange> getPageRanges() const;
 
 private:
     uint8_t* addANewPage(PageAllocator* pageAllocator);
@@ -107,6 +109,7 @@ public:
     void checkpointInMemory();
 
     void reclaimStorage(PageAllocator& pageAllocator) const;
+    std::vector<PageRange> getPageRanges() const;
 
     common::page_idx_t getHeaderPageIdx() const { return headerPageIdx; }
 
