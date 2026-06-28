@@ -136,17 +136,22 @@ static std::unique_ptr<TableFuncBindData> bindFunc(const main::ClientContext* co
             catalog->containsIndex(transaction, tableID, tableEntry->getPrimaryKeyID());
         auto* nodeTable = storageManager->getTable(tableID)->ptrCast<storage::NodeTable>();
         for (auto& indexHolder : nodeTable->getIndexes()) {
-            auto* index = indexHolder.getIndex();
-            const auto& storageIndexInfo = index->getIndexInfo();
+            const auto& storageIndexInfo = indexHolder.getIndexInfo();
+            if (!storageIndexInfo.isPrimary || !storageIndexInfo.isBuiltin) {
+                continue;
+            }
             if (seenIndexes.contains(getSeenKey(tableID, storageIndexInfo.name))) {
                 continue;
             }
             if (storageIndexInfo.isPrimary && hasCatalogPKIndex) {
                 continue;
             }
+            if (!indexHolder.isLoaded()) {
+                continue;
+            }
             indexesInfo.emplace_back(tableEntry->getName(), storageIndexInfo.name,
                 storageIndexInfo.indexType,
-                getPropertyNames(*tableEntry, storageIndexInfo.columnIDs), index->isLoaded(),
+                getPropertyNames(*tableEntry, storageIndexInfo.columnIDs), true,
                 "" /* indexDefinition */);
         }
     }

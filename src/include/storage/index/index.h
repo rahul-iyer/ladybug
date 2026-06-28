@@ -227,6 +227,7 @@ public:
 
     std::string getName() const { return indexInfo.name; }
     bool isLoaded() const { return loaded; }
+    const IndexInfo& getIndexInfo() const { return indexInfo; }
 
     void serialize(common::Serializer& ser) const;
     LBUG_API void load(main::ClientContext* context, StorageManager* storageManager);
