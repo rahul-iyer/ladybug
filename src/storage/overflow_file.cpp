@@ -188,8 +188,7 @@ std::vector<PageRange> OverflowFileHandle::getPageRanges() const {
             break;
         }
 
-        DASSERT(!pageWriteCache.contains(pageIdx));
-        overflowFile.readFromDisk(TransactionType::CHECKPOINT, pageIdx, [&pageIdx](auto* frame) {
+        read(TransactionType::CHECKPOINT, pageIdx, [&pageIdx](auto* frame) {
             pageIdx = *reinterpret_cast<page_idx_t*>(frame + END_OF_PAGE);
         });
     }
