@@ -2,9 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
-#include <cstring>
-#include <thread>
 
 #include "common/constants.h"
 #include "common/file_system/virtual_file_system.h"
@@ -64,56 +61,69 @@ enum class CSVBoundaryScannerSeed : uint8_t {
     COUNT,
 };
 
-struct CSVBoundaryScannerTransitionResult {
-    CSVBoundaryScannerSeed outSeed = CSVBoundaryScannerSeed::OutsideFieldStart;
-    CSVBoundaryScannerSeed overlapOutSeed = CSVBoundaryScannerSeed::OutsideFieldStart;
-    bool hasBoundary = false;
-    uint64_t firstBoundaryOffset = 0;
-    uint64_t lastBoundaryOffset = 0;
-    uint64_t maxClosedRowLength = 0;
+struct CSVOverlapBoundaryResult {
+    bool foundBoundary = false;
     bool detectedQuotedMultiline = false;
     bool sawInvalidQuotedTransition = false;
+    uint64_t boundaryOffset = 0;
 };
 
-struct CSVBoundaryChunkSummary {
-    std::array<CSVBoundaryScannerTransitionResult,
-        static_cast<uint8_t>(CSVBoundaryScannerSeed::COUNT)>
-        transitions;
+struct CSVOverlapSeedBoundaryResult {
+    bool usable = false;
+    bool hasBoundaryAtOrAfterCut = false;
+    bool detectedQuotedMultiline = false;
+    bool sawInvalidQuotedTransition = false;
+    uint64_t boundaryOffset = 0;
 };
 
-struct RangeAccumulator {
-    explicit RangeAccumulator(idx_t fileIdx) : fileIdx{fileIdx} {}
+std::vector<CSVParseRange> makeSingleFileRange(idx_t fileIdx, uint64_t fileSize) {
+    std::vector<CSVParseRange> ranges;
+    if (fileSize > 0) {
+        ranges.push_back(CSVParseRange{fileIdx, 0, fileSize, 0, true});
+    }
+    return ranges;
+}
 
-    void finalizeBoundary(uint64_t boundaryOffset) {
-        detectedOversizedLogicalRow =
-            detectedOversizedLogicalRow ||
-            boundaryOffset - currentLogicalRowStart > CopyConstants::PARALLEL_BLOCK_SIZE;
-        currentLogicalRowStart = boundaryOffset;
-        if (boundaryOffset - currentRangeStart < CopyConstants::PARALLEL_BLOCK_SIZE) {
-            return;
+struct CSVAdjustedChunkRanges {
+    std::vector<CSVParseRange> ranges;
+    bool detectedOversizedLogicalRow = false;
+};
+
+struct CSVFileBoundaryProperties {
+    bool detectedQuotedMultiline = false;
+    bool detectedOversizedLogicalRow = false;
+};
+
+CSVAdjustedChunkRanges makeAdjustedChunkRanges(idx_t fileIdx, uint64_t fileSize,
+    const std::vector<uint64_t>& adjustedBoundaries) {
+    CSVAdjustedChunkRanges result;
+    if (fileSize == 0) {
+        return result;
+    }
+    uint64_t currentRangeStart = 0;
+    uint64_t previousBoundary = 0;
+    block_idx_t nextRangeIdx = 0;
+    for (auto boundaryOffset : adjustedBoundaries) {
+        if (boundaryOffset <= currentRangeStart) {
+            continue;
         }
-        ranges.push_back(CSVParseRange{fileIdx, currentRangeStart, boundaryOffset, nextRangeIdx++,
-            currentRangeStart == 0});
+        result.detectedOversizedLogicalRow =
+            result.detectedOversizedLogicalRow ||
+            boundaryOffset - previousBoundary > CopyConstants::PARALLEL_BLOCK_SIZE;
+        previousBoundary = boundaryOffset;
+        result.ranges.push_back(CSVParseRange{fileIdx, currentRangeStart, boundaryOffset,
+            nextRangeIdx++, currentRangeStart == 0});
         currentRangeStart = boundaryOffset;
     }
-
-    void finalizeEOF(uint64_t fileSize) {
-        detectedOversizedLogicalRow =
-            detectedOversizedLogicalRow ||
-            fileSize - currentLogicalRowStart > CopyConstants::PARALLEL_BLOCK_SIZE;
-        if (fileSize > currentRangeStart) {
-            ranges.push_back(CSVParseRange{fileIdx, currentRangeStart, fileSize, nextRangeIdx++,
-                currentRangeStart == 0});
-        }
+    result.detectedOversizedLogicalRow =
+        result.detectedOversizedLogicalRow ||
+        fileSize - previousBoundary > CopyConstants::PARALLEL_BLOCK_SIZE;
+    if (fileSize > currentRangeStart) {
+        result.ranges.push_back(CSVParseRange{fileIdx, currentRangeStart, fileSize, nextRangeIdx++,
+            currentRangeStart == 0});
     }
-
-    idx_t fileIdx;
-    uint64_t currentRangeStart = 0;
-    uint64_t currentLogicalRowStart = 0;
-    block_idx_t nextRangeIdx = 0;
-    bool detectedOversizedLogicalRow = false;
-    std::vector<CSVParseRange> ranges;
-};
+    return result;
+}
 
 struct CSVBoundaryScannerRuntimeState {
     CSVBoundaryScannerState state = CSVBoundaryScannerState::OutsideField;
@@ -155,23 +165,6 @@ CSVBoundaryScannerRuntimeState runtimeStateFromSeed(CSVBoundaryScannerSeed seed,
         UNREACHABLE_CODE;
     }
     return state;
-}
-
-CSVBoundaryScannerSeed seedFromRuntimeState(const CSVBoundaryScannerRuntimeState& state) {
-    switch (state.state) {
-    case CSVBoundaryScannerState::OutsideField:
-        return state.atFieldStart ? CSVBoundaryScannerSeed::OutsideFieldStart :
-                                    CSVBoundaryScannerSeed::OutsideFieldMiddle;
-    case CSVBoundaryScannerState::InQuotedField:
-        return CSVBoundaryScannerSeed::InQuotedField;
-    case CSVBoundaryScannerState::AfterQuote:
-        return CSVBoundaryScannerSeed::AfterQuote;
-    case CSVBoundaryScannerState::Escaped:
-        return CSVBoundaryScannerSeed::Escaped;
-    case CSVBoundaryScannerState::CarriageReturn:
-        return CSVBoundaryScannerSeed::CarriageReturn;
-    }
-    UNREACHABLE_CODE;
 }
 
 class CSVBoundaryScannerFSM {
@@ -413,163 +406,102 @@ void processChunk(const char* buffer, uint64_t bytesToRead, uint64_t chunkOffset
     }
 }
 
-CSVBoundaryChunkSummary scanAllTransitions(const char* buffer, uint64_t bytesToRead,
-    uint64_t nominalBytesToRead, uint64_t chunkOffset, const CSVOption& option,
-    const CSVBoundaryScannerFSM& fsm) {
-    static constexpr uint64_t SIMD_WIDTH = 16;
-    static constexpr auto NUM_SEEDS = static_cast<uint8_t>(CSVBoundaryScannerSeed::COUNT);
-    CSVBoundaryChunkSummary summary;
-    std::array<CSVBoundaryScannerRuntimeState, NUM_SEEDS> runtimeStates;
-    std::array<uint64_t, NUM_SEEDS> previousBoundaries;
-    for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
-        runtimeStates[seedIdx] =
-            runtimeStateFromSeed(static_cast<CSVBoundaryScannerSeed>(seedIdx), chunkOffset);
-        previousBoundaries[seedIdx] = chunkOffset;
-    }
+CSVFileBoundaryProperties scanWholeFileProperties(FileInfo* fileInfo, uint64_t fileSize,
+    const CSVOption& option) {
+    CSVFileBoundaryProperties result;
+    auto buffer = std::make_unique<char[]>(fileSize);
+    fileInfo->readFromFile(buffer.get(), fileSize, 0);
 
-    auto consumeSpan = [&](uint64_t spanLength) {
-        if (spanLength == 0) {
-            return;
-        }
-        for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
-            auto onBoundary = [&](uint64_t boundaryOffset) {
-                auto& result = summary.transitions[seedIdx];
-                if (!result.hasBoundary) {
-                    result.firstBoundaryOffset = boundaryOffset;
-                    result.hasBoundary = true;
-                }
-                result.maxClosedRowLength = std::max<uint64_t>(result.maxClosedRowLength,
-                    boundaryOffset - previousBoundaries[seedIdx]);
-                result.lastBoundaryOffset = boundaryOffset;
-                previousBoundaries[seedIdx] = boundaryOffset;
-            };
-            fsm.consumeBoringSpan(spanLength, onBoundary, runtimeStates[seedIdx]);
-        }
-    };
-    auto stepByte = [&](char c, uint64_t absoluteOffset) {
-        for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
-            auto& result = summary.transitions[seedIdx];
-            auto onBoundary = [&](uint64_t boundaryOffset) {
-                if (!result.hasBoundary) {
-                    result.firstBoundaryOffset = boundaryOffset;
-                    result.hasBoundary = true;
-                }
-                result.maxClosedRowLength = std::max<uint64_t>(result.maxClosedRowLength,
-                    boundaryOffset - previousBoundaries[seedIdx]);
-                result.lastBoundaryOffset = boundaryOffset;
-                previousBoundaries[seedIdx] = boundaryOffset;
-            };
-            fsm.step(c, absoluteOffset, onBoundary, result.detectedQuotedMultiline,
-                runtimeStates[seedIdx]);
-        }
-    };
-    auto processBytes = [&](uint64_t start, uint64_t end) {
-        uint64_t i = start;
-        while (i < end) {
-            const auto laneWidth = std::min<uint64_t>(SIMD_WIDTH, end - i);
-            const auto masks = scanInterestingBytes(buffer + i, laneWidth, option);
-            if (masks.interesting == 0) {
-                consumeSpan(laneWidth);
-                i += laneWidth;
-                continue;
-            }
-
-            uint64_t lastProcessed = 0;
-            auto interesting = masks.interesting;
-            while (interesting != 0) {
-                const auto bit = std::countr_zero(interesting);
-                consumeSpan(bit - lastProcessed);
-                stepByte(buffer[i + bit], chunkOffset + i + bit);
-                lastProcessed = bit + 1;
-                interesting &= interesting - 1;
-            }
-            consumeSpan(laneWidth - lastProcessed);
-            i += laneWidth;
-        }
-    };
-
-    processBytes(0, nominalBytesToRead);
-    for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
-        summary.transitions[seedIdx].outSeed = seedFromRuntimeState(runtimeStates[seedIdx]);
-    }
-    if (bytesToRead > nominalBytesToRead) {
-        processBytes(nominalBytesToRead, bytesToRead);
-    }
-    for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
-        auto& result = summary.transitions[seedIdx];
-        result.overlapOutSeed = seedFromRuntimeState(runtimeStates[seedIdx]);
-        result.sawInvalidQuotedTransition = runtimeStates[seedIdx].sawInvalidQuotedTransition;
-    }
-    return summary;
-}
-
-CSVBoundaryScannerTransitionResult scanUntilBoundary(FileInfo* fileInfo, uint64_t fileSize,
-    uint64_t offset, uint64_t previousBoundary, const CSVOption& option,
-    CSVBoundaryScannerSeed inSeed) {
-    static constexpr uint64_t MAX_EXTENSION_SIZE = 1u << 20;
-    CSVBoundaryScannerTransitionResult result;
-    if (offset >= fileSize) {
-        result.outSeed = inSeed;
-        result.overlapOutSeed = inSeed;
-        return result;
-    }
     CSVBoundaryScannerFSM fsm{option};
-    auto runtimeState = runtimeStateFromSeed(inSeed, offset);
-    auto extensionSize = CopyConstants::PARALLEL_BLOCK_SIZE;
-    auto onBoundary = [&result, &previousBoundary](uint64_t boundaryOffset) {
-        if (!result.hasBoundary) {
-            result.firstBoundaryOffset = boundaryOffset;
-            result.hasBoundary = true;
-        }
-        result.maxClosedRowLength =
-            std::max<uint64_t>(result.maxClosedRowLength, boundaryOffset - previousBoundary);
-        result.lastBoundaryOffset = boundaryOffset;
+    auto runtimeState = runtimeStateFromSeed(CSVBoundaryScannerSeed::OutsideFieldStart, 0);
+    uint64_t previousBoundary = 0;
+    auto onBoundary = [&](uint64_t boundaryOffset) {
+        result.detectedOversizedLogicalRow =
+            result.detectedOversizedLogicalRow ||
+            boundaryOffset - previousBoundary > CopyConstants::PARALLEL_BLOCK_SIZE;
         previousBoundary = boundaryOffset;
     };
-    while (offset < fileSize && !result.hasBoundary) {
-        const auto bytesToRead = std::min<uint64_t>(extensionSize, fileSize - offset);
-        auto buffer = std::make_unique<char[]>(bytesToRead);
-        fileInfo->readFromFile(buffer.get(), bytesToRead, offset);
-        processChunk(buffer.get(), bytesToRead, offset, option, fsm, runtimeState,
-            result.detectedQuotedMultiline, onBoundary);
-        offset += bytesToRead;
-        extensionSize = std::min<uint64_t>(extensionSize * 2, MAX_EXTENSION_SIZE);
-    }
-    result.outSeed = seedFromRuntimeState(runtimeState);
-    result.overlapOutSeed = result.outSeed;
-    result.sawInvalidQuotedTransition = runtimeState.sawInvalidQuotedTransition;
+    processChunk(buffer.get(), fileSize, 0, option, fsm, runtimeState,
+        result.detectedQuotedMultiline, onBoundary);
+    result.detectedOversizedLogicalRow =
+        result.detectedOversizedLogicalRow ||
+        fileSize - previousBoundary > CopyConstants::PARALLEL_BLOCK_SIZE;
     return result;
 }
 
-template<typename Func>
-void parallelFor(uint64_t count, uint64_t numThreads, Func&& func) {
-    if (count == 0) {
-        return;
+CSVOverlapSeedBoundaryResult scanOverlapSeedForBoundary(const char* buffer, uint64_t bytesToRead,
+    uint64_t windowOffset, uint64_t cutOffset, uint64_t fileSize, const CSVOption& option,
+    const CSVBoundaryScannerFSM& fsm, CSVBoundaryScannerSeed seed, bool startsAtFileStart) {
+    CSVOverlapSeedBoundaryResult result;
+    auto runtimeState = runtimeStateFromSeed(seed, windowOffset);
+    bool hasBoundaryBeforeOrAtCut = startsAtFileStart;
+    auto onBoundary = [&](uint64_t boundaryOffset) {
+        if (boundaryOffset <= cutOffset) {
+            hasBoundaryBeforeOrAtCut = true;
+        }
+        if (boundaryOffset >= cutOffset && !result.hasBoundaryAtOrAfterCut) {
+            result.hasBoundaryAtOrAfterCut = true;
+            result.boundaryOffset = boundaryOffset;
+        }
+    };
+    processChunk(buffer, bytesToRead, windowOffset, option, fsm, runtimeState,
+        result.detectedQuotedMultiline, onBoundary);
+    result.sawInvalidQuotedTransition = runtimeState.sawInvalidQuotedTransition;
+    if (!result.hasBoundaryAtOrAfterCut && windowOffset + bytesToRead == fileSize &&
+        runtimeState.state != CSVBoundaryScannerState::InQuotedField &&
+        runtimeState.state != CSVBoundaryScannerState::Escaped) {
+        result.hasBoundaryAtOrAfterCut = true;
+        result.boundaryOffset = fileSize;
     }
-    numThreads = std::max<uint64_t>(1, std::min<uint64_t>(numThreads, count));
-    std::atomic<uint64_t> nextIdx = 0;
-    std::vector<std::thread> threads;
-    threads.reserve(numThreads);
-    for (uint64_t i = 0; i < numThreads; ++i) {
-        threads.emplace_back([&]() {
-            while (true) {
-                const auto idx = nextIdx.fetch_add(1);
-                if (idx >= count) {
-                    return;
-                }
-                func(idx);
-            }
-        });
+    result.usable = hasBoundaryBeforeOrAtCut && !result.sawInvalidQuotedTransition &&
+                    result.hasBoundaryAtOrAfterCut;
+    return result;
+}
+
+CSVOverlapBoundaryResult scanOverlapForBoundary(FileInfo* fileInfo, uint64_t fileSize,
+    uint64_t cutOffset, uint64_t overlapSize, const CSVOption& option) {
+    const auto windowOffset = cutOffset > overlapSize ? cutOffset - overlapSize : 0;
+    const auto windowEnd = std::min<uint64_t>(fileSize, cutOffset + overlapSize);
+    const auto bytesToRead = windowEnd - windowOffset;
+    auto buffer = std::make_unique<char[]>(bytesToRead);
+    fileInfo->readFromFile(buffer.get(), bytesToRead, windowOffset);
+
+    CSVOverlapBoundaryResult result;
+    CSVBoundaryScannerFSM fsm{option};
+    const auto firstSeed =
+        windowOffset == 0 ? static_cast<uint8_t>(CSVBoundaryScannerSeed::OutsideFieldStart) : 0;
+    const auto endSeed =
+        windowOffset == 0 ? firstSeed + 1 : static_cast<uint8_t>(CSVBoundaryScannerSeed::COUNT);
+    for (auto seedIdx = firstSeed; seedIdx < endSeed; ++seedIdx) {
+        // CSV quoting is not self-synchronizing in general. A cut is safe only when every usable
+        // seed that reaches a real row boundary before the cut agrees on the same next boundary.
+        // Disagreement means the window is still ambiguous, so the caller expands the overlap and
+        // eventually falls back to a single file-sized range if ambiguity remains.
+        auto seedResult =
+            scanOverlapSeedForBoundary(buffer.get(), bytesToRead, windowOffset, cutOffset, fileSize,
+                option, fsm, static_cast<CSVBoundaryScannerSeed>(seedIdx), windowOffset == 0);
+        result.detectedQuotedMultiline =
+            result.detectedQuotedMultiline || seedResult.detectedQuotedMultiline;
+        result.sawInvalidQuotedTransition =
+            result.sawInvalidQuotedTransition || seedResult.sawInvalidQuotedTransition;
+        if (!seedResult.usable) {
+            continue;
+        }
+        if (!result.foundBoundary) {
+            result.foundBoundary = true;
+            result.boundaryOffset = seedResult.boundaryOffset;
+        } else if (result.boundaryOffset != seedResult.boundaryOffset) {
+            result.foundBoundary = false;
+            return result;
+        }
     }
-    for (auto& thread : threads) {
-        thread.join();
-    }
+    return result;
 }
 
 } // namespace
 
-CSVBoundaryScanResult CSVBoundaryScanner::scanFile(const std::string& filePath, idx_t fileIdx,
-    const CSVOption& option, main::ClientContext* context) {
+CSVBoundaryScanResult CSVBoundaryScanner::planFixedChunkOverlap(const std::string& filePath,
+    idx_t fileIdx, const CSVOption& option, main::ClientContext* context) {
     auto fileInfo = VirtualFileSystem::GetUnsafe(*context)->openFile(filePath,
         FileOpenFlags(FileFlags::READ_ONLY
 #ifdef _WIN32
@@ -583,112 +515,55 @@ CSVBoundaryScanResult CSVBoundaryScanner::scanFile(const std::string& filePath, 
         return result;
     }
 
-    static constexpr uint64_t SCAN_CHUNK_SIZE = 1u << 20;
-    static constexpr uint64_t INITIAL_OVERLAP_SIZE = 1u << 10;
-    static constexpr uint64_t PLANNED_RANGE_TARGET_SIZE = SCAN_CHUNK_SIZE;
-    const auto numChunks = (result.fileSize + SCAN_CHUNK_SIZE - 1) / SCAN_CHUNK_SIZE;
-    const auto numThreads = std::max<uint64_t>(1, context->getMaxNumThreadForExec());
-    std::vector<CSVBoundaryChunkSummary> chunkSummaries(numChunks);
-
-    parallelFor(numChunks, numThreads, [&](uint64_t chunkIdx) {
-        auto localFileInfo = VirtualFileSystem::GetUnsafe(*context)->openFile(filePath,
-            FileOpenFlags(FileFlags::READ_ONLY
-#ifdef _WIN32
-                          | FileFlags::BINARY
-#endif
-                ),
-            context);
-        const auto chunkOffset = chunkIdx * SCAN_CHUNK_SIZE;
-        const auto nominalBytesToRead =
-            std::min<uint64_t>(SCAN_CHUNK_SIZE, result.fileSize - chunkOffset);
-        const auto bytesToRead = std::min<uint64_t>(nominalBytesToRead + INITIAL_OVERLAP_SIZE,
-            result.fileSize - chunkOffset);
-        auto buffer = std::make_unique<char[]>(bytesToRead);
-        localFileInfo->readFromFile(buffer.get(), bytesToRead, chunkOffset);
-        CSVBoundaryScannerFSM fsm{option};
-        chunkSummaries[chunkIdx] = scanAllTransitions(buffer.get(), bytesToRead, nominalBytesToRead,
-            chunkOffset, option, fsm);
-    });
-
-    RangeAccumulator rangeAccumulator{fileIdx};
-    uint64_t currentLogicalRowStart = 0;
-    bool sawInvalidQuotedTransition = false;
-    auto currentSeed = CSVBoundaryScannerSeed::OutsideFieldStart;
-    for (uint64_t chunkIdx = 0; chunkIdx < numChunks; ++chunkIdx) {
-        auto replayResult = chunkSummaries[chunkIdx].transitions[static_cast<uint8_t>(currentSeed)];
-        currentSeed = replayResult.outSeed;
-        const auto chunkOffset = chunkIdx * SCAN_CHUNK_SIZE;
-        const auto nominalEndOffset =
-            std::min<uint64_t>(result.fileSize, chunkOffset + SCAN_CHUNK_SIZE);
-        const auto overlappedEndOffset =
-            std::min<uint64_t>(result.fileSize, nominalEndOffset + INITIAL_OVERLAP_SIZE);
-        const auto rangeTargetOffset =
-            rangeAccumulator.currentRangeStart + PLANNED_RANGE_TARGET_SIZE;
-        const auto shouldExtend =
-            rangeTargetOffset <= nominalEndOffset &&
-            (!replayResult.hasBoundary || replayResult.lastBoundaryOffset < rangeTargetOffset) &&
-            overlappedEndOffset < result.fileSize;
-        if (shouldExtend) {
-            const auto extensionPreviousBoundary =
-                replayResult.hasBoundary ? replayResult.lastBoundaryOffset : currentLogicalRowStart;
-            auto extensionResult =
-                scanUntilBoundary(fileInfo.get(), result.fileSize, overlappedEndOffset,
-                    extensionPreviousBoundary, option, replayResult.overlapOutSeed);
-            sawInvalidQuotedTransition =
-                sawInvalidQuotedTransition || extensionResult.sawInvalidQuotedTransition;
-            result.detectedQuotedMultiline =
-                result.detectedQuotedMultiline || extensionResult.detectedQuotedMultiline;
-            if (extensionResult.hasBoundary) {
-                if (!replayResult.hasBoundary) {
-                    replayResult.firstBoundaryOffset = extensionResult.firstBoundaryOffset;
-                }
-                replayResult.hasBoundary = true;
-                replayResult.lastBoundaryOffset = extensionResult.lastBoundaryOffset;
-                replayResult.maxClosedRowLength =
-                    std::max(replayResult.maxClosedRowLength, extensionResult.maxClosedRowLength);
-            }
+    const auto blockSize = CopyConstants::PARALLEL_BLOCK_SIZE;
+    const auto numBlocks = (result.fileSize + blockSize - 1) / blockSize;
+    if (numBlocks == 1) {
+        const auto properties = scanWholeFileProperties(fileInfo.get(), result.fileSize, option);
+        result.detectedQuotedMultiline = properties.detectedQuotedMultiline;
+        result.detectedOversizedLogicalRow = properties.detectedOversizedLogicalRow;
+        result.usePlannedRanges =
+            result.detectedQuotedMultiline || result.detectedOversizedLogicalRow;
+        if (result.usePlannedRanges) {
+            result.ranges = makeSingleFileRange(fileIdx, result.fileSize);
         }
-        sawInvalidQuotedTransition =
-            sawInvalidQuotedTransition || replayResult.sawInvalidQuotedTransition;
-        result.detectedQuotedMultiline =
-            result.detectedQuotedMultiline || replayResult.detectedQuotedMultiline;
-        if (!replayResult.hasBoundary ||
-            replayResult.lastBoundaryOffset <= currentLogicalRowStart) {
+        return result;
+    }
+    std::vector<uint64_t> adjustedBoundaries;
+    adjustedBoundaries.reserve(numBlocks > 0 ? numBlocks - 1 : 0);
+    for (uint64_t blockIdx = 1; blockIdx < numBlocks; ++blockIdx) {
+        const auto cutOffset = blockIdx * blockSize;
+        CSVOverlapBoundaryResult overlapResult;
+        auto currentOverlapSize = blockSize;
+        while (true) {
+            overlapResult = scanOverlapForBoundary(fileInfo.get(), result.fileSize, cutOffset,
+                currentOverlapSize, option);
+            result.detectedQuotedMultiline =
+                result.detectedQuotedMultiline || overlapResult.detectedQuotedMultiline;
+            if (overlapResult.foundBoundary) {
+                break;
+            }
+            if (currentOverlapSize >= result.fileSize) {
+                result.ranges = makeSingleFileRange(fileIdx, result.fileSize);
+                result.usePlannedRanges = !result.ranges.empty();
+                return result;
+            }
+            currentOverlapSize = std::min<uint64_t>(result.fileSize, currentOverlapSize * 2);
+        }
+        if (!adjustedBoundaries.empty() &&
+            overlapResult.boundaryOffset <= adjustedBoundaries.back()) {
             continue;
         }
-        const auto firstNewBoundaryOffset =
-            std::max(replayResult.firstBoundaryOffset, currentLogicalRowStart);
-        rangeAccumulator.detectedOversizedLogicalRow =
-            rangeAccumulator.detectedOversizedLogicalRow ||
-            firstNewBoundaryOffset - currentLogicalRowStart > CopyConstants::PARALLEL_BLOCK_SIZE ||
-            replayResult.maxClosedRowLength > CopyConstants::PARALLEL_BLOCK_SIZE;
-        currentLogicalRowStart = replayResult.lastBoundaryOffset;
-        if (replayResult.lastBoundaryOffset > rangeAccumulator.currentRangeStart &&
-            replayResult.lastBoundaryOffset - rangeAccumulator.currentRangeStart >=
-                PLANNED_RANGE_TARGET_SIZE) {
-            rangeAccumulator.ranges.push_back(CSVParseRange{fileIdx,
-                rangeAccumulator.currentRangeStart, replayResult.lastBoundaryOffset,
-                rangeAccumulator.nextRangeIdx++, rangeAccumulator.currentRangeStart == 0});
-            rangeAccumulator.currentRangeStart = replayResult.lastBoundaryOffset;
-        }
+        // Planned ranges must start and end at logical row boundaries. We only accept a cut when
+        // every usable FSM seed in the overlap window resolves to the same next boundary; otherwise
+        // the overlap expands, and an unresolved cut falls back to one file-sized range.
+        adjustedBoundaries.push_back(overlapResult.boundaryOffset);
     }
-
-    sawInvalidQuotedTransition = sawInvalidQuotedTransition ||
-                                 currentSeed == CSVBoundaryScannerSeed::InQuotedField ||
-                                 currentSeed == CSVBoundaryScannerSeed::Escaped;
-    rangeAccumulator.detectedOversizedLogicalRow =
-        rangeAccumulator.detectedOversizedLogicalRow ||
-        result.fileSize - currentLogicalRowStart > CopyConstants::PARALLEL_BLOCK_SIZE;
-    if (result.fileSize > rangeAccumulator.currentRangeStart) {
-        rangeAccumulator.ranges.push_back(
-            CSVParseRange{fileIdx, rangeAccumulator.currentRangeStart, result.fileSize,
-                rangeAccumulator.nextRangeIdx++, rangeAccumulator.currentRangeStart == 0});
-    }
-    result.ranges = std::move(rangeAccumulator.ranges);
-    result.detectedOversizedLogicalRow = rangeAccumulator.detectedOversizedLogicalRow;
+    auto adjustedRanges = makeAdjustedChunkRanges(fileIdx, result.fileSize, adjustedBoundaries);
+    result.ranges = std::move(adjustedRanges.ranges);
+    result.detectedOversizedLogicalRow = adjustedRanges.detectedOversizedLogicalRow;
     result.usePlannedRanges =
         (result.detectedQuotedMultiline || result.detectedOversizedLogicalRow) &&
-        !sawInvalidQuotedTransition && !result.ranges.empty();
+        !result.ranges.empty();
     if (!result.usePlannedRanges) {
         result.ranges.clear();
     }

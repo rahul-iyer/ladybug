@@ -76,7 +76,8 @@ uint64_t ParallelCSVReader::parseRange(const CSVParseRange& range, DataChunk& re
         return 0;
     }
     ParallelParsingDriver driver(resultChunk, this);
-    const auto [numRowsRead, numErrors] = parseCSV(driver);
+    const auto [numRowsRead, numErrors] =
+        supportsStructuralParser() ? parseCSVStructural(driver) : parseCSV(driver);
     increaseNumRowsInCurrentBlock(numRowsRead, numErrors);
     return numRowsRead;
 }
@@ -88,7 +89,10 @@ void ParallelCSVReader::reportFinishedBlock() {
 uint64_t ParallelCSVReader::continueBlock(DataChunk& resultChunk) {
     DASSERT(hasMoreToRead());
     ParallelParsingDriver driver(resultChunk, this);
-    const auto [numRowsParsed, numErrors] = parseCSV(driver);
+    const auto [numRowsParsed, numErrors] =
+        parseMode == ParseMode::PLANNED_RANGE && supportsStructuralParser() ?
+            parseCSVStructural(driver) :
+            parseCSV(driver);
     increaseNumRowsInCurrentBlock(numRowsParsed, numErrors);
     return numRowsParsed;
 }
@@ -172,7 +176,7 @@ ParallelCSVScanSharedState::ParallelCSVScanSharedState(FileScanInfo fileScanInfo
     main::ClientContext* context, CSVOption csvOption, CSVColumnInfo columnInfo,
     std::vector<FileScanPlan> filePlans)
     : ScanFileWithProgressSharedState{std::move(fileScanInfo), numRows, context},
-      csvOption{std::move(csvOption)}, columnInfo{std::move(columnInfo)}, scheduledBytes{0},
+      csvOption{std::move(csvOption)}, columnInfo{std::move(columnInfo)}, completedBytes{0},
       filePlans{std::move(filePlans)} {
     errorHandlers.reserve(this->fileScanInfo.getNumFiles());
     for (idx_t i = 0; i < this->fileScanInfo.getNumFiles(); ++i) {
@@ -217,12 +221,12 @@ ParallelCSVScanSharedState::ParseTask ParallelCSVScanSharedState::getNextTask() 
             task.usePlannedRange = plan.usePlannedRanges;
             if (task.usePlannedRange) {
                 task.range = plan.ranges[task.unitIdx];
-                scheduledBytes += task.range.endOffset - task.range.startOffset;
+                task.byteSize = task.range.endOffset - task.range.startOffset;
             } else {
                 const auto startOffset = task.unitIdx * CopyConstants::PARALLEL_BLOCK_SIZE;
                 const auto endOffset = std::min<uint64_t>(plan.fileSize,
                     startOffset + CopyConstants::PARALLEL_BLOCK_SIZE);
-                scheduledBytes += endOffset > startOffset ? endOffset - startOffset : 0;
+                task.byteSize = endOffset > startOffset ? endOffset - startOffset : 0;
             }
             return task;
         }
@@ -248,12 +252,15 @@ static offset_t tableFunc(const TableFuncInput& input, TableFuncOutput& output) 
                 }
             }
             localState->reader->reportFinishedBlock();
+            sharedState->completedBytes += localState->currentTaskBytes;
+            localState->currentTaskBytes = 0;
         }
         auto task = sharedState->getNextTask();
         if (task.fileIdx == INVALID_IDX) {
             return 0;
         }
         const auto fileIdx = task.fileIdx;
+        localState->currentTaskBytes = task.byteSize;
         if (fileIdx != localState->fileIdx || localState->reader == nullptr) {
             localState->fileIdx = fileIdx;
             localState->errorHandler =
@@ -281,6 +288,8 @@ static offset_t tableFunc(const TableFuncInput& input, TableFuncOutput& output) 
         }
         if (localState->reader->isEOF()) {
             localState->reader->reportFinishedBlock();
+            sharedState->completedBytes += localState->currentTaskBytes;
+            localState->currentTaskBytes = 0;
             localState->errorHandler->finalize();
             localState->reader = nullptr;
             localState->errorHandler = nullptr;
@@ -352,8 +361,8 @@ static std::unique_ptr<TableFuncSharedState> initSharedState(
         auto filePath = bindData->fileScanInfo.filePaths[i];
         ParallelCSVScanSharedState::FileScanPlan plan;
         if (csvConfig.multilineParallel) {
-            auto scanResult =
-                CSVBoundaryScanner::scanFile(filePath, i, csvOption.copy(), bindData->context);
+            auto scanResult = CSVBoundaryScanner::planFixedChunkOverlap(filePath, i,
+                csvOption.copy(), bindData->context);
             plan.fileSize = scanResult.fileSize;
             plan.usePlannedRanges = scanResult.usePlannedRanges;
             if (plan.usePlannedRanges) {
@@ -395,7 +404,7 @@ static double progressFunc(TableFuncSharedState* sharedState) {
     if (state->totalSize == 0) {
         return 0.0;
     }
-    uint64_t totalReadSize = state->scheduledBytes;
+    uint64_t totalReadSize = state->completedBytes;
     if (totalReadSize > state->totalSize) {
         return 1.0;
     }

@@ -49,6 +49,7 @@ struct ParallelCSVLocalState final : public function::TableFuncLocalState {
     std::unique_ptr<ParallelCSVReader> reader;
     std::unique_ptr<LocalFileErrorHandler> errorHandler;
     common::idx_t fileIdx = common::INVALID_IDX;
+    uint64_t currentTaskBytes = 0;
 };
 
 struct ParallelCSVScanSharedState final : public function::ScanFileWithProgressSharedState {
@@ -62,13 +63,14 @@ struct ParallelCSVScanSharedState final : public function::ScanFileWithProgressS
     struct ParseTask {
         common::idx_t fileIdx = common::INVALID_IDX;
         common::block_idx_t unitIdx = 0;
+        uint64_t byteSize = 0;
         bool usePlannedRange = false;
         CSVParseRange range{};
     };
 
     common::CSVOption csvOption;
     CSVColumnInfo columnInfo;
-    std::atomic<uint64_t> scheduledBytes = 0;
+    std::atomic<uint64_t> completedBytes = 0;
     std::vector<SharedFileErrorHandler> errorHandlers;
     populate_func_t populateErrorFunc;
     std::vector<FileScanPlan> filePlans;

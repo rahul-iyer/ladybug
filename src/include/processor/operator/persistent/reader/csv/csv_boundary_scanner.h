@@ -41,8 +41,8 @@ struct CSVBoundaryScanResult {
 
 class CSVBoundaryScanner {
 public:
-    static CSVBoundaryScanResult scanFile(const std::string& filePath, common::idx_t fileIdx,
-        const common::CSVOption& option, main::ClientContext* context);
+    static CSVBoundaryScanResult planFixedChunkOverlap(const std::string& filePath,
+        common::idx_t fileIdx, const common::CSVOption& option, main::ClientContext* context);
 };
 
 } // namespace processor
