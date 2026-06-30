@@ -14,8 +14,8 @@ class BaseCSVReader;
 class SerialCSVReader;
 
 struct LinesPerBlock {
-    uint64_t numLines;
-    bool doneParsingBlock;
+    uint64_t numLines = 0;
+    bool doneParsingBlock = false;
 };
 
 class SharedFileErrorHandler;

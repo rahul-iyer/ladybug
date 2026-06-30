@@ -11,10 +11,30 @@
 ---- 1
 1
 
--STATEMENT LOAD FROM "${LBUG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/basic.csv" RETURN COUNT(*)
----- error
-Copy exception: Error in file ${LBUG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/basic.csv on line 1: Quoted newlines are not supported in parallel CSV reader. Please specify PARALLEL=FALSE in the options. Line/record containing the error: '"abc'
+-STATEMENT MATCH (m:`middle-column`) RETURN COUNT(*)
+---- 1
+1
 
--STATEMENT LOAD FROM "${LBUG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/mixed-newlines.csv" RETURN COUNT(*)
----- error
-Copy exception: Error in file ${LBUG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/mixed-newlines.csv on line 1: Quoted newlines are not supported in parallel CSV reader. Please specify PARALLEL=FALSE in the options. Line/record containing the error: '"abc'
+-STATEMENT MATCH (c:crlf) RETURN COUNT(*)
+---- 1
+1
+
+-STATEMENT LOAD FROM "${LBUG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/basic.csv" (MULTILINE_PARALLEL=true) RETURN COUNT(*)
+---- 1
+1
+
+-STATEMENT LOAD FROM "${LBUG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/mixed-newlines.csv" (MULTILINE_PARALLEL=true) RETURN COUNT(*)
+---- 1
+1
+
+-STATEMENT LOAD FROM "${LBUG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/middle-column.csv" (MULTILINE_PARALLEL=true) RETURN COUNT(*)
+---- 1
+1
+
+-STATEMENT LOAD FROM "${LBUG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/crlf.csv" (MULTILINE_PARALLEL=true) RETURN COUNT(*)
+---- 1
+1
+
+-STATEMENT LOAD FROM "${LBUG_ROOT_DIRECTORY}/dataset/csv-multiline-quote-tests/crlf-block.csv" (MULTILINE_PARALLEL=true) RETURN COUNT(*)
+---- 1
+901
