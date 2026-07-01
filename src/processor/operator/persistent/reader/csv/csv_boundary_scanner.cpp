@@ -413,33 +413,94 @@ void processChunk(const char* buffer, uint64_t bytesToRead, uint64_t chunkOffset
     }
 }
 
-CSVBoundaryScannerTransitionResult scanTransition(const char* buffer, uint64_t bytesToRead,
+CSVBoundaryChunkSummary scanAllTransitions(const char* buffer, uint64_t bytesToRead,
     uint64_t nominalBytesToRead, uint64_t chunkOffset, const CSVOption& option,
-    const CSVBoundaryScannerFSM& fsm, CSVBoundaryScannerSeed inSeed) {
-    CSVBoundaryScannerTransitionResult result;
-    auto runtimeState = runtimeStateFromSeed(inSeed, chunkOffset);
-    uint64_t previousBoundary = chunkOffset;
-    auto onBoundary = [&result, &previousBoundary](uint64_t boundaryOffset) {
-        if (!result.hasBoundary) {
-            result.firstBoundaryOffset = boundaryOffset;
-            result.hasBoundary = true;
-        }
-        result.maxClosedRowLength =
-            std::max<uint64_t>(result.maxClosedRowLength, boundaryOffset - previousBoundary);
-        result.lastBoundaryOffset = boundaryOffset;
-        previousBoundary = boundaryOffset;
-    };
-    processChunk(buffer, nominalBytesToRead, chunkOffset, option, fsm, runtimeState,
-        result.detectedQuotedMultiline, onBoundary);
-    result.outSeed = seedFromRuntimeState(runtimeState);
-    if (bytesToRead > nominalBytesToRead) {
-        processChunk(buffer + nominalBytesToRead, bytesToRead - nominalBytesToRead,
-            chunkOffset + nominalBytesToRead, option, fsm, runtimeState,
-            result.detectedQuotedMultiline, onBoundary);
+    const CSVBoundaryScannerFSM& fsm) {
+    static constexpr uint64_t SIMD_WIDTH = 16;
+    static constexpr auto NUM_SEEDS = static_cast<uint8_t>(CSVBoundaryScannerSeed::COUNT);
+    CSVBoundaryChunkSummary summary;
+    std::array<CSVBoundaryScannerRuntimeState, NUM_SEEDS> runtimeStates;
+    std::array<uint64_t, NUM_SEEDS> previousBoundaries;
+    for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
+        runtimeStates[seedIdx] =
+            runtimeStateFromSeed(static_cast<CSVBoundaryScannerSeed>(seedIdx), chunkOffset);
+        previousBoundaries[seedIdx] = chunkOffset;
     }
-    result.overlapOutSeed = seedFromRuntimeState(runtimeState);
-    result.sawInvalidQuotedTransition = runtimeState.sawInvalidQuotedTransition;
-    return result;
+
+    auto consumeSpan = [&](uint64_t spanLength) {
+        if (spanLength == 0) {
+            return;
+        }
+        for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
+            auto onBoundary = [&](uint64_t boundaryOffset) {
+                auto& result = summary.transitions[seedIdx];
+                if (!result.hasBoundary) {
+                    result.firstBoundaryOffset = boundaryOffset;
+                    result.hasBoundary = true;
+                }
+                result.maxClosedRowLength = std::max<uint64_t>(result.maxClosedRowLength,
+                    boundaryOffset - previousBoundaries[seedIdx]);
+                result.lastBoundaryOffset = boundaryOffset;
+                previousBoundaries[seedIdx] = boundaryOffset;
+            };
+            fsm.consumeBoringSpan(spanLength, onBoundary, runtimeStates[seedIdx]);
+        }
+    };
+    auto stepByte = [&](char c, uint64_t absoluteOffset) {
+        for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
+            auto& result = summary.transitions[seedIdx];
+            auto onBoundary = [&](uint64_t boundaryOffset) {
+                if (!result.hasBoundary) {
+                    result.firstBoundaryOffset = boundaryOffset;
+                    result.hasBoundary = true;
+                }
+                result.maxClosedRowLength = std::max<uint64_t>(result.maxClosedRowLength,
+                    boundaryOffset - previousBoundaries[seedIdx]);
+                result.lastBoundaryOffset = boundaryOffset;
+                previousBoundaries[seedIdx] = boundaryOffset;
+            };
+            fsm.step(c, absoluteOffset, onBoundary, result.detectedQuotedMultiline,
+                runtimeStates[seedIdx]);
+        }
+    };
+    auto processBytes = [&](uint64_t start, uint64_t end) {
+        uint64_t i = start;
+        while (i < end) {
+            const auto laneWidth = std::min<uint64_t>(SIMD_WIDTH, end - i);
+            const auto masks = scanInterestingBytes(buffer + i, laneWidth, option);
+            if (masks.interesting == 0) {
+                consumeSpan(laneWidth);
+                i += laneWidth;
+                continue;
+            }
+
+            uint64_t lastProcessed = 0;
+            auto interesting = masks.interesting;
+            while (interesting != 0) {
+                const auto bit = std::countr_zero(interesting);
+                consumeSpan(bit - lastProcessed);
+                stepByte(buffer[i + bit], chunkOffset + i + bit);
+                lastProcessed = bit + 1;
+                interesting &= interesting - 1;
+            }
+            consumeSpan(laneWidth - lastProcessed);
+            i += laneWidth;
+        }
+    };
+
+    processBytes(0, nominalBytesToRead);
+    for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
+        summary.transitions[seedIdx].outSeed = seedFromRuntimeState(runtimeStates[seedIdx]);
+    }
+    if (bytesToRead > nominalBytesToRead) {
+        processBytes(nominalBytesToRead, bytesToRead);
+    }
+    for (auto seedIdx = 0u; seedIdx < NUM_SEEDS; ++seedIdx) {
+        auto& result = summary.transitions[seedIdx];
+        result.overlapOutSeed = seedFromRuntimeState(runtimeStates[seedIdx]);
+        result.sawInvalidQuotedTransition = runtimeStates[seedIdx].sawInvalidQuotedTransition;
+    }
+    return summary;
 }
 
 CSVBoundaryScannerTransitionResult scanUntilBoundary(FileInfo* fileInfo, uint64_t fileSize,
@@ -545,12 +606,8 @@ CSVBoundaryScanResult CSVBoundaryScanner::scanFile(const std::string& filePath, 
         auto buffer = std::make_unique<char[]>(bytesToRead);
         localFileInfo->readFromFile(buffer.get(), bytesToRead, chunkOffset);
         CSVBoundaryScannerFSM fsm{option};
-        for (auto seedIdx = 0u; seedIdx < static_cast<uint8_t>(CSVBoundaryScannerSeed::COUNT);
-             ++seedIdx) {
-            chunkSummaries[chunkIdx].transitions[seedIdx] =
-                scanTransition(buffer.get(), bytesToRead, nominalBytesToRead, chunkOffset, option,
-                    fsm, static_cast<CSVBoundaryScannerSeed>(seedIdx));
-        }
+        chunkSummaries[chunkIdx] = scanAllTransitions(buffer.get(), bytesToRead, nominalBytesToRead,
+            chunkOffset, option, fsm);
     });
 
     RangeAccumulator rangeAccumulator{fileIdx};
