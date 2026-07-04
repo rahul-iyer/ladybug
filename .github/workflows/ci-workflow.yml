@@ -147,7 +147,7 @@ jobs:
       TEST_JOBS: 4
       NUM_THREADS: 4
       WERROR: ${{ matrix.platform == 'windows' && '0' || '1' }}
-      EXTRA_CMAKE_FLAGS: ${{ matrix.platform == 'windows' && '-DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded -DBUILD_STATIC_LBUG=FALSE' || '' }}
+      EXTRA_CMAKE_FLAGS: ${{ matrix.platform == 'windows' && '-DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded -DBUILD_STATIC_LBUG=FALSE -DLBUG_ENABLE_SIMD_TEST_COMPILE_FLAGS=TRUE' || '-DLBUG_ENABLE_SIMD_TEST_COMPILE_FLAGS=TRUE' }}
     steps:
       - uses: ilammy/msvc-dev-cmd@v1
         if: matrix.platform == 'windows'
